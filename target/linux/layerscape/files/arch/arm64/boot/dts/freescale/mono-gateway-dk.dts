@@ -971,12 +971,21 @@
 		status = "okay";
 	};
 
+	/* The cages switch line rate at runtime (sdk_dpaa mac-cage.c): the
+	 * fixed-link is the rate at boot, mono,serdes-lane the SerDes1 lane
+	 * that gets moved (registers count lanes in reverse of the RCW
+	 * protocol nibbles: XFI.9 is lane D, XFI.10 lane C), mono,retimer the
+	 * DS100DF410 channels in front of the cage, host->module first.
+	 * Measured on a DK: retimer channels 0/1 serve sfp-xfi0, 2/3 sfp-xfi1.
+	 */
 	fm1_mac9: ethernet@f0000 { /* 10GEC1 */
 		/delete-property/ managed;
 		sfp = <&sfp_xfi0>;
 		fixed-link = <0 1 10000 0 0>;
 		phy-connection-type = "xgmii";
 		pcs-handle-names = "xfi";  /* Match enet7 for consistency */
+		mono,serdes-lane = <&serdes1 3>;
+		mono,retimer = <&retimer 0 1>;
 	};
 
 	fm1_mac10: ethernet@f2000 { /* 10GEC2 */
@@ -984,6 +993,8 @@
 		sfp = <&sfp_xfi1>;
 		fixed-link = <0 1 10000 0 0>;
 		phy-connection-type = "xgmii";
+		mono,serdes-lane = <&serdes1 2>;
+		mono,retimer = <&retimer 2 3>;
 	};
 
 	mdio@fc000 {
