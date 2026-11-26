@@ -1,0 +1,1892 @@
+Subject: [PATCH] sdk_dpaa: switch the SFP cages' line rate at runtime
+
+The Gateway DK's two cages sit on MAC9 and MAC10, pinned at 10GBASE-R by a
+fixed-link. With the cage attached to the netdev (the previous patch) a 1G
+or 2.5G module is detected, but nothing on the host side can talk to it: a
+GPON stick, a 1000BASE-X optic or a copper SFP never gets a link.
+
+Pick a line rate from what the module offers (sfp_parse_support() and the
+sfp quirks) and move the hardware to it at runtime, fastest first, keeping
+the first mode whose PCS reports link: 10GBASE-R, 2500BASE-X, 1000BASE-X
+with and without clause 37 negotiation, SGMII. "ethtool -s ethX speed N
+autoneg off" pins a rate; "autoneg on" returns to the search.
+
+A switch moves:
+ - the SerDes1 lane: protocol, equalisation, PLL and rate, with the values
+   of mainline phy-fsl-lynx-10g.c, and the RCW override of mainline
+   soc/fsl/guts.c that swaps the lane between the MAC's XGMII and GMII
+   sides. 1G runs from PLL1, the 100 MHz-referenced PLL of the copper SGMII
+   ports. 2500BASE-X needs 3.125 GHz, which only PLL2 (156.25 MHz, the XFI
+   PLL) can make: PLL1 hangs the SoC when reset at 3.125 GHz, while a reset
+   at 5 GHz relocks at once. So one cage at 2.5G and the other at 10G cannot
+   coexist on this board; both at 2.5G, or any mix of 10G and 1G, can.
+ - the DS100DF410 retimer channels in front of the cage: CDR at 10G, raw
+   mode below (TI SNLA323), as their CDR only locks at 10.3125G.
+ - the mEMAC and its PCS, through a new FM_MAC_SetEnetMode().
+
+PLL2 goes to 10G when both want it: a cage at 2.5G gives way (falls back
+to 1G) while the other cage is open with a 10G-capable module, whichever
+came up first. An ethtool-forced 2.5G keeps the PLL.
+
+The link a port reports becomes LOS and the 10GBASE-R PCS together at 10G
+(a DAC has no LOS), the 1G PCS alone below: a stick stays reachable over
+its host link without fibre. An up link has to read down three times,
+100 ms apart, before the carrier drops, and a failed PCS read keeps the
+last state: single bad reads (seen every few minutes on a 1000BASE-X
+MA5671A link) otherwise cost a bridge port its STP listening/learning time.
+
+Fix a NULL dereference in memac_sfp_link_update() from the previous patch:
+the fixed-PHY link_update callback stays registered across a stop/start,
+and on the next start of_phy_connect() re-probes the fixed PHY before
+attached_dev is set, so "ip link set ethX up" after a down oopsed with
+rtnl held (seen as a watchdog reboot).
+
+Also give slow GPON sticks three minutes to answer on the EEPROM bus
+instead of one: a Huawei MA5671A was still booting when the cage gave up.
+
+Lanes, PLLs and retimer channels were measured on a DK. Tested there with
+a Ubiquiti DAC-SFP10-1M to a MikroTik CRS309 (10G, and 2.5G with the
+switch port forced) and a Huawei MA5671A (1000BASE-X and 2500BASE-X),
+including runtime 2.5G <-> 1G switches with the PLL retune and cage
+down/up cycles.
+---
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
+@@ -53,6 +53,7 @@
+ #include "dpaa_debugfs.h"
+ #endif /* CONFIG_FSL_DPAA_DBG_LOOP */
+ #include "mac.h"
++#include "mac-cage.h"
+ 
+ /* Size in bytes of the FQ taildrop threshold */
+ #define DPA_FQ_TD		0x200000
+@@ -212,8 +213,10 @@
+ 		_errno = err ? err : _errno;
+ 	}
+ 
+-	if (mac_dev->sfp_bus)
++	if (mac_dev->sfp_bus) {
+ 		sfp_upstream_stop(mac_dev->sfp_bus);
++		mac_cage_stop(mac_dev);
++	}
+ 
+ 	if (mac_dev->phy_dev)
+ 		phy_disconnect(mac_dev->phy_dev);
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c
+@@ -47,6 +47,7 @@
+ 
+ #include "dpaa_eth.h"
+ #include "mac.h"                /* struct mac_device */
++#include "mac-cage.h"
+ #include "dpaa_eth_common.h"
+ 
+ static const char dpa_stats_percpu[][ETH_GSTRING_LEN] = {
+@@ -156,6 +157,12 @@
+ 		netdev_info(net_dev, "This is a MAC-less interface\n");
+ 		return -ENODEV;
+ 	}
++	/* A cage that switches rates knows the line rate; the fixed-link PHY
++	 * only knows the DT's.
++	 */
++	if (priv->mac_dev->cage)
++		return mac_cage_get_ksettings(priv->mac_dev, cmd);
++
+ 	if (unlikely(priv->mac_dev->phy_dev == NULL)) {
+ 		netdev_dbg(net_dev, "phy device not initialized\n");
+ 		return 0;
+@@ -178,6 +185,12 @@
+ 		netdev_info(net_dev, "This is a MAC-less interface\n");
+ 		return -ENODEV;
+ 	}
++	/* "speed N autoneg off" pins the cage's rate, "autoneg on" lets it
++	 * pick one again.
++	 */
++	if (priv->mac_dev->cage)
++		return mac_cage_set_ksettings(priv->mac_dev, cmd);
++
+ 	if (unlikely(priv->mac_dev->phy_dev == NULL)) {
+ 		netdev_dbg(net_dev, "phy device not initialized\n");
+ 		return -ENODEV;
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/mac-api.c
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/mac-api.c
+@@ -50,6 +50,7 @@
+ 
+ #include "dpaa_eth.h"
+ #include "mac.h"
++#include "mac-cage.h"
+ #include "lnxwrp_fsl_fman.h"
+ 
+ #include "error_ext.h"	/* GET_ERROR_TYPE, E_OK */
+@@ -365,15 +366,25 @@
+ 
+ /* Link state of a port that has an SFP cage. Installed on the fixed-link
+  * PHY, so phylib keeps publishing the link -- it just stops being the value
+- * the device tree pinned, and becomes what the cage reports.
++ * the device tree pinned, and becomes what the cage reports: LOS alone for
++ * a fixed-rate cage, the PCS as well for one that switches rates. The speed
++ * stays the DT's; the emulated PHY cannot express 2.5G, and ethtool asks
++ * the cage instead.
+  */
+ static int memac_sfp_link_update(struct net_device *net_dev,
+ 				 struct fixed_phy_status *status)
+ {
+-	struct dpa_priv_s *priv = netdev_priv(net_dev);
+-	struct mac_device *mac_dev = priv->mac_dev;
++	struct dpa_priv_s *priv;
++
++	/* The callback stays registered across stop/start, and on the next
++	 * start of_phy_connect() re-probes the fixed PHY before it has an
++	 * attached_dev: genphy_read_abilities() then lands here with NULL.
++	 */
++	if (!net_dev)
++		return 0;
+ 
+-	status->link = mac_dev->sfp_link;
++	priv = netdev_priv(net_dev);
++	status->link = mac_cage_link(priv->mac_dev);
+ 
+ 	return 0;
+ }
+@@ -471,6 +482,7 @@
+ 				    "fixed_phy_set_link_update() = %d; link state stays pinned by the DT\n",
+ 				    err);
+ 		netif_carrier_off(net_dev);
++		mac_cage_start(mac_dev);
+ 		sfp_upstream_start(mac_dev->sfp_bus);
+ 	}
+ 
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/mac.c
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/mac.c
+@@ -56,6 +56,7 @@
+ #include "lnxwrp_fm_ext.h"
+ 
+ #include "mac.h"
++#include "mac-cage.h"
+ 
+ /* A port with an "sfp" phandle gets attached to the cage below, so that
+  * module presence (mod-def0) and loss of signal (LOS) can drive the link
+@@ -68,6 +69,7 @@
+ 	struct mac_device *mac_dev = upstream;
+ 
+ 	mac_dev->sfp_link = true;
++	mac_cage_kick(mac_dev);
+ 	if (mac_dev->phy_dev)
+ 		phy_trigger_machine(mac_dev->phy_dev);
+ }
+@@ -77,6 +79,7 @@
+ 	struct mac_device *mac_dev = upstream;
+ 
+ 	mac_dev->sfp_link = false;
++	mac_cage_kick(mac_dev);
+ 	if (mac_dev->phy_dev)
+ 		phy_trigger_machine(mac_dev->phy_dev);
+ }
+@@ -84,10 +87,12 @@
+ static int mac_sfp_module_insert(void *upstream,
+ 				 const struct sfp_eeprom_id *id)
+ {
+-	/* The MACs that take a cage run at a single fixed rate, so there is
+-	 * no configuration to derive from the module: accept it and let LOS
+-	 * decide whether the link is up.
++	/* With a SerDes lane described, the cage picks a line rate the module
++	 * can take (mac-cage.c). Without one the MAC stays at its fixed rate:
++	 * accept the module and let LOS decide whether the link is up.
+ 	 */
++	mac_cage_module_insert(upstream, id);
++
+ 	return 0;
+ }
+ 
+@@ -96,6 +101,7 @@
+ 	struct mac_device *mac_dev = upstream;
+ 
+ 	mac_dev->sfp_link = false;
++	mac_cage_module_remove(mac_dev);
+ 	if (mac_dev->phy_dev)
+ 		phy_trigger_machine(mac_dev->phy_dev);
+ }
+@@ -422,15 +428,29 @@
+ 			goto _return_dev_set_drvdata;
+ 		}
+ 		if (bus) {
++			/* The cage first: a module already fitted is reported
++			 * as soon as the upstream is added.
++			 */
++			mac_dev->sfp_bus = bus;
++			_errno = mac_cage_probe(mac_dev, mac_node);
++			if (_errno) {
++				mac_dev->sfp_bus = NULL;
++				sfp_bus_put(bus);
++				if (_errno != -EPROBE_DEFER)
++					dev_err(dev, "mac_cage_probe() = %d\n",
++						_errno);
++				goto _return_dev_set_drvdata;
++			}
+ 			_errno = sfp_bus_add_upstream(bus, mac_dev,
+ 						      &mac_sfp_ops);
+ 			if (_errno) {
++				mac_cage_remove(mac_dev);
++				mac_dev->sfp_bus = NULL;
+ 				sfp_bus_put(bus);
+ 				dev_err(dev, "sfp_bus_add_upstream() = %d\n",
+ 					_errno);
+ 				goto _return_dev_set_drvdata;
+ 			}
+-			mac_dev->sfp_bus = bus;
+ 		}
+ 	}
+ 
+@@ -470,8 +490,10 @@
+ 	dev = &of_dev->dev;
+ 	mac_dev = (struct mac_device *)dev_get_drvdata(dev);
+ 
+-	if (mac_dev->sfp_bus)
++	if (mac_dev->sfp_bus) {
+ 		sfp_bus_del_upstream(mac_dev->sfp_bus);
++		mac_cage_remove(mac_dev);
++	}
+ 
+ 	for_each_port_device(i, mac_dev->port_dev)
+ 		fm_port_unbind(mac_dev->port_dev[i]);
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/mac-cage.c
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/mac-cage.c
+@@ -0,0 +1,1303 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Runtime line-rate switching for SFP cages on the 10G-capable mEMACs of an
++ * LS1046A (MAC9, MAC10), for the SDK DPAA driver.
++ *
++ * PR #16 attached the cages to the netdevs, but left both MACs pinned at
++ * 10GBASE-R by a fixed-link: a 1G or 2.5G module (a GPON stick, a 1000BASE-X
++ * optic, a copper SFP) could be detected, never talked to. This picks a line
++ * rate for whatever module is fitted and moves three things to it at runtime:
++ *
++ *  - the SerDes lane: protocol, equalisation, PLL and rate. The register
++ *    values are those of mainline drivers/phy/freescale/phy-fsl-lynx-10g.c,
++ *    and so is the "RCW override" that swaps the lane between the XGMII and
++ *    the GMII side of the MAC (soc/fsl/guts.c, LS1046A_RCWSR5_SRDS_PRTCL_S1).
++ *    Mainline never retunes a PLL; 2500BASE-X needs one at 3.125 GHz, so here
++ *    a PLL that only cages use may be retuned while none of them needs 10G.
++ *  - the retimer channels in front of the cage, if any (TI DS1x0DF410): their
++ *    CDR only locks at 10.3125G, below that they must run in raw mode
++ *    (TI SNLA323, "Raw mode (CDR Bypassed)"); unlocked, they mute.
++ *  - the MAC and its PCS (fm_mac_set_enet_mode()).
++ *
++ * Device tree, on the MAC node next to its "sfp" phandle:
++ *	mono,serdes-lane = <&serdes1 LANE>;	the lane, as a mainline "phys"
++ *						specifier would give it
++ *	mono,retimer = <&retimer TX RX>;	optional: host->module and
++ *						module->host retimer channels
++ * and the DCFG node must give its DCSR window (reg-names "dcfg_dcsr").
++ * Not "phys": fw_devlink would hold the MAC's probe for a Lynx 10G PHY
++ * driver this kernel does not have.
++ *
++ * Choosing a mode: the module's EEPROM, through sfp_parse_support() and the
++ * sfp quirks, says which interfaces it can take. They are tried fastest first
++ * (10GBASE-R, 2500BASE-X, 1000BASE-X with and without in-band negotiation,
++ * SGMII) until the PCS reports link, and the first that does is kept: a
++ * Huawei MA5671A on stock firmware advertises 2500BASE-X through its quirk
++ * but only runs 1000BASE-X, and falls back to it on its own. "ethtool -s
++ * ethX speed N autoneg off" pins a rate, "autoneg on" returns to the search.
++ *
++ * Link: at 10G the module's LOS and the 10GBASE-R PCS must both report link
++ * (a DAC has no LOS, so the PCS is what says the far end is there). Below
++ * 10G only the 1G PCS counts: an optic without light squelches its output
++ * anyway, and a GPON stick must stay reachable over its host link with no
++ * fibre plugged in.
++ */
++
++/* The SDK headers first: they define TRUE/FALSE unconditionally, ACPI's
++ * (through linux/i2c.h) only if not defined yet.
++ */
++#include "dpaa_eth.h"
++#include "mac.h"
++#include "mac-cage.h"
++
++#include <linux/bitfield.h>
++#include <linux/delay.h>
++#include <linux/i2c.h>
++#include <linux/iopoll.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/of_platform.h>
++#include <linux/phy.h>
++#include <linux/phy_fixed.h>
++#include <linux/sfp.h>
++#include <linux/workqueue.h>
++
++/* SerDes (Lynx 10G), offsets as in phy-fsl-lynx-10g.c */
++#define PLLnRSTCTL(pll)		((pll) * 0x20 + 0x0)
++#define PLLnRSTCTL_RST		BIT(31)
++#define PLLnRSTCTL_RSTDONE	BIT(30)
++#define PLLnRSTCTL_RSTERR	BIT(29)
++#define PLLnCR0(pll)		((pll) * 0x20 + 0x4)
++#define PLLnCR0_POFF		BIT(31)
++#define PLLnCR0_REFCLK_SEL	GENMASK(30, 28)
++#define PLLnCR0_PLL_LCK		BIT(23)
++#define PLLnCR0_FRATE_SEL	GENMASK(19, 16)
++#define FRATE_5G		0x0
++#define FRATE_5_15625G		0x6
++#define FRATE_3_125G		0x9
++
++#define PCCR8			0x220
++#define PCCRB			0x22c
++#define SGMIIaCR0(lane)		(0x1800 + (lane) * 0x10)
++#define SGMIIaCR1(lane)		(SGMIIaCR0(lane) + 0x4)
++#define SGMIIaCR0_RST_SGM	BIT(31)
++#define SGMIIaCR0_PD_SGM	BIT(30)
++#define SGMIIaCR1_SGPCS_EN	BIT(11)
++
++#define LNaGCR0(lane)		(0x800 + (lane) * 0x40 + 0x00)
++#define LNaGCR1(lane)		(0x800 + (lane) * 0x40 + 0x04)
++#define LNaRECR0(lane)		(0x800 + (lane) * 0x40 + 0x10)
++#define LNaTECR0(lane)		(0x800 + (lane) * 0x40 + 0x18)
++#define LNaTTLCR0(lane)		(0x800 + (lane) * 0x40 + 0x20)
++#define LNaTCSR3(lane)		(0x800 + (lane) * 0x40 + 0x3c)
++
++#define GCR0_RPLL_PLLF		BIT(31)
++#define GCR0_RRAT_SEL		GENMASK(29, 28)
++#define GCR0_TPLL_PLLF		BIT(27)
++#define GCR0_TRAT_SEL		GENMASK(25, 24)
++#define GCR0_RRST		BIT(22)
++#define GCR0_TRST		BIT(21)
++#define GCR0_RX_PD		BIT(20)
++#define GCR0_TX_PD		BIT(19)
++#define GCR0_IF20BIT_EN		BIT(18)
++#define GCR0_PROTS		GENMASK(11, 7)
++#define PROTS_SGMII		0x1
++#define PROTS_XFI		0xa
++
++#define GCR1_MASK		(GENMASK(22, 20) | GENMASK(19, 18) | \
++				 GENMASK(17, 16) | BIT(15) | BIT(14) | \
++				 GENMASK(5, 4) | GENMASK(1, 0))
++#define RECR0_MASK		(BIT(28) | GENMASK(27, 24) | GENMASK(19, 16) | \
++				 BIT(15) | BIT(14) | GENMASK(11, 10))
++#define TECR0_MASK		(GENMASK(29, 28) | BIT(26) | GENMASK(25, 22) | \
++				 BIT(21) | GENMASK(20, 16) | GENMASK(13, 8) | \
++				 GENMASK(5, 0))
++
++enum { RAT_FULL = 0, RAT_HALF = 1, RAT_QUARTER = 2, RAT_DOUBLE = 3 };
++
++/* DCFG: RCWSR5 in CCSR, its writable twin RCWCR5 in DCSR */
++#define DCFG_RCWSR5		0x110
++#define RCWSR5_SRDS_PRTCL_S1(lane) GENMASK(19 + 4 * (lane), 16 + 4 * (lane))
++#define SRDS_PRTCL_XFI		1
++#define SRDS_PRTCL_SGMII	3
++
++/* DS1x0DF410 retimer, TI SNLA323 */
++#define RT_CHSEL		0xff
++#define RT_CHSEL_CHANNEL	0x04
++#define RT_RESET		0x00
++#define RT_RESET_REGS		0x04
++#define RT_CDR_RESET		0x0a
++#define RT_CDR_RESET_MASK	0x0c
++#define RT_STATUS		0x02
++#define RT_STATUS_LOCK		0x18
++
++#define CAGE_TRY_MS		3000	/* per mode, before the next is tried */
++#define CAGE_RETRY_DOWN_MS	10000	/* a lost link this long restarts the search */
++#define CAGE_DOWN_READS		3	/* bad reads in a row before the carrier drops */
++#define CAGE_DOWN_READ_MS	100	/* ... taken this far apart */
++
++enum cage_mode {
++	CAGE_MODE_NONE = 0,
++	CAGE_MODE_10GBASER,
++	CAGE_MODE_2500BASEX,
++	CAGE_MODE_1000BASEX,
++	CAGE_MODE_SGMII,
++};
++
++struct cage_try {
++	enum cage_mode mode;
++	bool an;
++};
++
++/* One SerDes block. The two cages of a Gateway DK share SerDes1 and its
++ * PLL2; this is what lets one of them retune that PLL only when the other
++ * does not need it.
++ */
++struct cage_serdes {
++	struct device_node *np;
++	void __iomem *base;
++	void __iomem *dcfg;
++	void __iomem *dcsr;
++	struct mutex lock;
++	struct list_head cages;
++	int refs;
++	struct list_head node;
++};
++
++struct mac_cage {
++	struct mac_device *mac_dev;
++	struct device *dev;
++	struct cage_serdes *serdes;
++	struct list_head node;
++	int lane;
++	u32 pccrb_xfi;			/* XFI mux value found at boot */
++
++	struct device_node *retimer_np;	/* resolved on first use */
++	struct i2c_client *retimer;
++	u8 rt_ch[2];
++
++	struct mutex lock;
++	struct delayed_work work;
++	bool running;			/* interface open */
++	bool present;			/* module inserted */
++	DECLARE_PHY_INTERFACE_MASK(module_ifs);
++	enum cage_mode forced;		/* ethtool, NONE = search */
++	bool claims_10g;		/* 10G is among the candidates */
++
++	struct cage_try tries[5];
++	int ntries;
++	int idx;
++	enum cage_mode mode;		/* what the hardware runs now */
++	bool an;
++	bool link;
++	bool locked;			/* search finished on a link */
++	bool pll_busy_logged;
++	int down_reads;			/* consecutive bad reads of an up link */
++	const char *last_why;
++	unsigned long down_since;
++};
++
++static LIST_HEAD(cage_serdes_list);
++static DEFINE_MUTEX(cage_serdes_list_lock);
++
++static const char *cage_mode_str(enum cage_mode mode)
++{
++	switch (mode) {
++	case CAGE_MODE_10GBASER:	return "10gbase-r";
++	case CAGE_MODE_2500BASEX:	return "2500base-x";
++	case CAGE_MODE_1000BASEX:	return "1000base-x";
++	case CAGE_MODE_SGMII:		return "sgmii";
++	default:			return "none";
++	}
++}
++
++static int cage_mode_speed(enum cage_mode mode)
++{
++	switch (mode) {
++	case CAGE_MODE_10GBASER:	return SPEED_10000;
++	case CAGE_MODE_2500BASEX:	return SPEED_2500;
++	case CAGE_MODE_1000BASEX:
++	case CAGE_MODE_SGMII:		return SPEED_1000;
++	default:			return SPEED_UNKNOWN;
++	}
++}
++
++static u32 srds_read(struct cage_serdes *s, u32 off)
++{
++	return ioread32be(s->base + off);
++}
++
++static void srds_write(struct cage_serdes *s, u32 off, u32 val)
++{
++	iowrite32be(val, s->base + off);
++}
++
++static void srds_rmw(struct cage_serdes *s, u32 off, u32 val, u32 mask)
++{
++	srds_write(s, off, (srds_read(s, off) & ~mask) | (val & mask));
++}
++
++/* ------------------------------------------------------------------------ */
++/* SerDes                                                                     */
++
++/* The protocol converter muxes of LS1046A SerDes1 (ls1046a_serdes1_get_pccr()
++ * in phy-fsl-lynx-10g.c): only lanes C and D (2, 3) carry an XFI converter.
++ */
++static int cage_xfi_shift(int lane)
++{
++	return lane == 2 ? 28 : 24;
++}
++
++static int cage_sgmii_shift(int lane)
++{
++	return 28 - lane * 4;
++}
++
++static int cage_pll_by_frate(struct cage_serdes *s, u32 frate)
++{
++	int pll;
++
++	for (pll = 0; pll < 2; pll++) {
++		u32 cr0 = srds_read(s, PLLnCR0(pll));
++
++		if (!(cr0 & PLLnCR0_POFF) &&
++		    FIELD_GET(PLLnCR0_FRATE_SEL, cr0) == frate)
++			return pll;
++	}
++
++	return -ENOENT;
++}
++
++static int cage_lane_pll(struct cage_serdes *s, int lane)
++{
++	return srds_read(s, LNaGCR0(lane)) & GCR0_TPLL_PLLF ? 0 : 1;
++}
++
++static struct mac_cage *cage_on_lane(struct cage_serdes *s, int lane)
++{
++	struct mac_cage *c;
++
++	list_for_each_entry(c, &s->cages, node)
++		if (c->lane == lane)
++			return c;
++
++	return NULL;
++}
++
++/* May @self retune @pll? Every other lane clocked by it must belong to a cage
++ * that does not need its current rate: no module, interface down, or running
++ * at another rate.
++ */
++static bool cage_pll_is_free(struct cage_serdes *s, struct mac_cage *self,
++			     int pll)
++{
++	int lane;
++
++	for (lane = 0; lane < 4; lane++) {
++		struct mac_cage *c;
++		u32 gcr0;
++
++		if (lane == self->lane)
++			continue;
++		gcr0 = srds_read(s, LNaGCR0(lane));
++		if ((gcr0 & (GCR0_RX_PD | GCR0_TX_PD)) ==
++		    (GCR0_RX_PD | GCR0_TX_PD))
++			continue;
++		if (cage_lane_pll(s, lane) != pll)
++			continue;
++
++		c = cage_on_lane(s, lane);
++		if (!c)
++			return false;	/* a lane we do not manage */
++		if (c->running && c->present &&
++		    (c->mode == CAGE_MODE_10GBASER ||
++		     c->mode == CAGE_MODE_2500BASEX))
++			return false;
++	}
++
++	return true;
++}
++
++static int cage_pll_set_rate(struct cage_serdes *s, int pll, u32 frate)
++{
++	u32 val;
++	int err;
++
++	if (FIELD_GET(PLLnCR0_FRATE_SEL, srds_read(s, PLLnCR0(pll))) == frate)
++		return 0;
++
++	srds_rmw(s, PLLnCR0(pll), FIELD_PREP(PLLnCR0_FRATE_SEL, frate),
++		 PLLnCR0_FRATE_SEL);
++	/* Reset request, as U-Boot's corenet SerDes code does after a FRATE
++	 * change; RSTDONE is still set from the last reset, so give the
++	 * request time to clear it before polling, and wait for lock too.
++	 */
++	srds_rmw(s, PLLnRSTCTL(pll), PLLnRSTCTL_RST, PLLnRSTCTL_RST);
++	usleep_range(100, 200);
++
++	err = read_poll_timeout(srds_read, val,
++				(val & PLLnRSTCTL_RSTERR) ||
++				((val & PLLnRSTCTL_RSTDONE) &&
++				 (srds_read(s, PLLnCR0(pll)) & PLLnCR0_PLL_LCK)),
++				100, 100000, false, s, PLLnRSTCTL(pll));
++	if (err || (val & PLLnRSTCTL_RSTERR)) {
++		pr_err("mac-cage: SerDes PLL%d did not lock at frate 0x%x (rstctl %08x cr0 %08x)\n",
++		       pll + 1, frate, val, srds_read(s, PLLnCR0(pll)));
++		return -EIO;
++	}
++
++	pr_info("mac-cage: SerDes PLL%d now at frate 0x%x\n", pll + 1, frate);
++
++	return 0;
++}
++
++/* Make sure a PLL runs at @frate for @c, retuning one only cages use. Returns
++ * the PLL index or a negative error.
++ */
++static int cage_pll_get(struct mac_cage *c, u32 frate, bool commit)
++{
++	struct cage_serdes *s = c->serdes;
++	int pll, own;
++
++	pll = cage_pll_by_frate(s, frate);
++	if (pll >= 0)
++		return pll;
++
++	/* Only the XFI PLL is ever retuned: it is the one clocking this lane
++	 * at 10G, and the SGMII PLL of the board's copper ports stays alone.
++	 */
++	own = cage_pll_by_frate(s, FRATE_5_15625G);
++	if (own < 0)
++		own = cage_pll_by_frate(s, FRATE_3_125G);
++	if (own < 0 || !cage_pll_is_free(s, c, own))
++		return -EBUSY;
++	if (!commit)
++		return own;
++
++	return cage_pll_set_rate(s, own, frate) ?: own;
++}
++
++/* Put a PLL that was retuned for 2500BASE-X back at 10G once no cage runs
++ * at 2.5G on it, so a 10G module on the other cage can come up.
++ */
++static void cage_pll_restore(struct mac_cage *c)
++{
++	struct cage_serdes *s = c->serdes;
++	struct mac_cage *o;
++	int pll;
++
++	pll = cage_pll_by_frate(s, FRATE_3_125G);
++	if (pll < 0)
++		return;
++
++	list_for_each_entry(o, &s->cages, node)
++		if (o->mode == CAGE_MODE_2500BASEX &&
++		    cage_lane_pll(s, o->lane) == pll)
++			return;
++
++	cage_pll_set_rate(s, pll, FRATE_5_15625G);
++}
++
++static int cage_rcw_override(struct mac_cage *c, u32 prtcl)
++{
++	struct cage_serdes *s = c->serdes;
++	u32 mask = RCWSR5_SRDS_PRTCL_S1(c->lane);
++	u32 sr, cr;
++
++	sr = ioread32be(s->dcfg + DCFG_RCWSR5);
++	cr = (sr & ~mask) | (prtcl << __ffs(mask));
++	if (sr == cr)
++		return 0;
++
++	iowrite32be(cr, s->dcsr + DCFG_RCWSR5);
++	udelay(1);
++	if (ioread32be(s->dcfg + DCFG_RCWSR5) != cr) {
++		dev_err(c->dev, "RCW override failed: RCWSR5 %08x, wrote %08x\n",
++			ioread32be(s->dcfg + DCFG_RCWSR5), cr);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++/* lynx_10g_proto_conf[] for the modes a cage uses */
++static void cage_lane_proto_conf(struct mac_cage *c, enum cage_mode mode)
++{
++	struct cage_serdes *s = c->serdes;
++	int l = c->lane;
++
++	switch (mode) {
++	case CAGE_MODE_10GBASER:
++		srds_rmw(s, LNaGCR0(l), FIELD_PREP(GCR0_PROTS, PROTS_XFI) |
++			 GCR0_IF20BIT_EN, GCR0_PROTS | GCR0_IF20BIT_EN);
++		srds_rmw(s, LNaGCR1(l), (2 << 4) | 2, GCR1_MASK);
++		srds_rmw(s, LNaRECR0(l), BIT(28) | (1 << 10), RECR0_MASK);
++		srds_rmw(s, LNaTECR0(l), (1 << 28) | BIT(21) | (3 << 16) |
++			 (48 << 8) | 7, TECR0_MASK);
++		srds_write(s, LNaTTLCR0(l), 0x00000400);
++		break;
++	case CAGE_MODE_2500BASEX:
++		srds_rmw(s, LNaGCR0(l), FIELD_PREP(GCR0_PROTS, PROTS_SGMII),
++			 GCR0_PROTS | GCR0_IF20BIT_EN);
++		srds_rmw(s, LNaGCR1(l), (2 << 4) | 2, GCR1_MASK);
++		srds_rmw(s, LNaRECR0(l), 0, RECR0_MASK);
++		srds_rmw(s, LNaTECR0(l), (1 << 28) | BIT(21) | (6 << 16) |
++			 (48 << 8), TECR0_MASK);
++		srds_write(s, LNaTTLCR0(l), 0x00000400);
++		break;
++	case CAGE_MODE_1000BASEX:
++	case CAGE_MODE_SGMII:
++		srds_rmw(s, LNaGCR0(l), FIELD_PREP(GCR0_PROTS, PROTS_SGMII),
++			 GCR0_PROTS | GCR0_IF20BIT_EN);
++		srds_rmw(s, LNaGCR1(l), (1 << 20) | (3 << 18) | BIT(14) |
++			 (1 << 4) | 1, GCR1_MASK);
++		srds_rmw(s, LNaRECR0(l), (15 << 24) | (15 << 16) | BIT(15) |
++			 BIT(14), RECR0_MASK);
++		srds_rmw(s, LNaTECR0(l), (48 << 8) | 6, TECR0_MASK);
++		srds_write(s, LNaTTLCR0(l), 0x39000400);
++		break;
++	default:
++		break;
++	}
++}
++
++static bool cage_mode_gmii(enum cage_mode mode)
++{
++	return mode == CAGE_MODE_2500BASEX || mode == CAGE_MODE_1000BASEX ||
++	       mode == CAGE_MODE_SGMII;
++}
++
++/* The converter (PCS) side of the lane: PCCRB for XFI, PCCR8 and the SGMII
++ * converter's own registers for the GMII modes.
++ */
++static void cage_lane_pcvt(struct mac_cage *c, enum cage_mode mode, bool on)
++{
++	struct cage_serdes *s = c->serdes;
++	int l = c->lane;
++
++	if (mode == CAGE_MODE_10GBASER) {
++		srds_rmw(s, PCCRB, on ? c->pccrb_xfi << cage_xfi_shift(l) : 0,
++			 GENMASK(2, 0) << cage_xfi_shift(l));
++		return;
++	}
++
++	if (on) {
++		srds_rmw(s, SGMIIaCR1(l), SGMIIaCR1_SGPCS_EN,
++			 SGMIIaCR1_SGPCS_EN);
++		srds_rmw(s, SGMIIaCR0(l), SGMIIaCR0_RST_SGM,
++			 SGMIIaCR0_RST_SGM | SGMIIaCR0_PD_SGM);
++		srds_rmw(s, PCCR8, 1 << cage_sgmii_shift(l),
++			 GENMASK(3, 0) << cage_sgmii_shift(l));
++	} else {
++		srds_rmw(s, PCCR8, 0, GENMASK(3, 0) << cage_sgmii_shift(l));
++		srds_rmw(s, SGMIIaCR1(l), 0, SGMIIaCR1_SGPCS_EN);
++		srds_rmw(s, SGMIIaCR0(l), SGMIIaCR0_PD_SGM,
++			 SGMIIaCR0_RST_SGM | SGMIIaCR0_PD_SGM);
++	}
++}
++
++/* What the lane runs, judged on protocol, rate and the PLL's frequency
++ * together: a lane left on a PLL that was retuned under it runs nothing.
++ */
++static enum cage_mode cage_lane_read_mode(struct mac_cage *c)
++{
++	struct cage_serdes *s = c->serdes;
++	u32 gcr0 = srds_read(s, LNaGCR0(c->lane));
++	int pll = cage_lane_pll(s, c->lane);
++	u32 frate = FIELD_GET(PLLnCR0_FRATE_SEL, srds_read(s, PLLnCR0(pll)));
++	u32 rat = FIELD_GET(GCR0_TRAT_SEL, gcr0);
++
++	switch (FIELD_GET(GCR0_PROTS, gcr0)) {
++	case PROTS_XFI:
++		if (frate == FRATE_5_15625G && rat == RAT_DOUBLE)
++			return CAGE_MODE_10GBASER;
++		break;
++	case PROTS_SGMII:
++		if (frate == FRATE_3_125G && rat == RAT_FULL)
++			return CAGE_MODE_2500BASEX;
++		if (frate == FRATE_5G && rat == RAT_QUARTER)
++			return CAGE_MODE_1000BASEX;
++		break;
++	}
++
++	return CAGE_MODE_NONE;
++}
++
++/* lynx_10g_set_mode(), plus the PLL retune for 2.5G */
++static int cage_lane_set_mode(struct mac_cage *c, enum cage_mode mode)
++{
++	struct cage_serdes *s = c->serdes;
++	enum cage_mode cur = cage_lane_read_mode(c);
++	u32 frate, rat, pllsel;
++	int l = c->lane, pll, err = 0;
++
++	switch (mode) {
++	case CAGE_MODE_10GBASER:
++		frate = FRATE_5_15625G;
++		rat = RAT_DOUBLE;
++		break;
++	case CAGE_MODE_2500BASEX:
++		frate = FRATE_3_125G;
++		rat = RAT_FULL;
++		break;
++	default:
++		frate = FRATE_5G;
++		rat = RAT_QUARTER;
++		break;
++	}
++
++	/* 1000BASE-X and SGMII share a lane setup */
++	if (cage_mode_gmii(cur) && cage_mode_gmii(mode) &&
++	    (cur == CAGE_MODE_2500BASEX) == (mode == CAGE_MODE_2500BASEX))
++		return 0;
++	if (cur == mode)
++		return 0;
++
++	/* Leaving 2.5G on this lane may let the PLL go back to 10G; that must
++	 * wait until the lane is off it, so it is done at the end.
++	 */
++	pll = cage_pll_get(c, frate, true);
++	if (pll < 0)
++		return pll;
++	pllsel = pll == 0 ? GCR0_RPLL_PLLF | GCR0_TPLL_PLLF : 0;
++
++	/* Halt: hold the lane in reset while it is reconfigured */
++	srds_rmw(s, LNaGCR0(l), 0, GCR0_RRST | GCR0_TRST);
++	usleep_range(1, 2);
++
++	/* A no-op when the RCW already routes the lane to that MAC */
++	err = cage_rcw_override(c, cage_mode_gmii(mode) ? SRDS_PRTCL_SGMII :
++							  SRDS_PRTCL_XFI);
++	if (err)
++		goto out;
++
++	if (cur != CAGE_MODE_NONE) {
++		cage_lane_pcvt(c, cur, false);
++	} else {
++		/* Unknown state: neither converter may stay on the lane */
++		cage_lane_pcvt(c, CAGE_MODE_10GBASER, false);
++		cage_lane_pcvt(c, CAGE_MODE_1000BASEX, false);
++	}
++	cage_lane_proto_conf(c, mode);
++	srds_rmw(s, LNaGCR0(l), pllsel | FIELD_PREP(GCR0_RRAT_SEL, rat) |
++		 FIELD_PREP(GCR0_TRAT_SEL, rat),
++		 GCR0_RPLL_PLLF | GCR0_TPLL_PLLF | GCR0_RRAT_SEL |
++		 GCR0_TRAT_SEL);
++	cage_lane_pcvt(c, mode, true);
++
++out:
++	usleep_range(1, 2);
++	srds_rmw(s, LNaGCR0(l), GCR0_RRST | GCR0_TRST, GCR0_RRST | GCR0_TRST);
++
++	return err;
++}
++
++/* ------------------------------------------------------------------------ */
++/* Retimer                                                                    */
++
++static int rt_rmw(struct i2c_client *rt, u8 reg, u8 val, u8 mask)
++{
++	int cur = i2c_smbus_read_byte_data(rt, reg);
++
++	if (cur < 0)
++		return cur;
++
++	return i2c_smbus_write_byte_data(rt, reg, (cur & ~mask) | (val & mask));
++}
++
++/* 10G: channel registers back to their defaults (10.3125G, CDR on).
++ * Below: TI SNLA323 table 39, "Bypass CDR".
++ */
++static int cage_retimer_set(struct mac_cage *c, enum cage_mode mode)
++{
++	struct i2c_client *rt;
++	int i, err = 0;
++
++	if (!c->retimer_np)
++		return 0;
++	/* Behind an i2c mux that may probe after the MAC: looked up here, not
++	 * at probe, so the MAC never has to defer for it.
++	 */
++	if (!c->retimer)
++		c->retimer = of_find_i2c_device_by_node(c->retimer_np);
++	rt = c->retimer;
++	if (!rt) {
++		dev_warn(c->dev, "cage: retimer %pOF not available\n",
++			 c->retimer_np);
++		return -EPROBE_DEFER;
++	}
++
++	for (i = 0; i < 2 && !err; i++) {
++		err = i2c_smbus_write_byte_data(rt, RT_CHSEL,
++						RT_CHSEL_CHANNEL | c->rt_ch[i]);
++		if (err)
++			break;
++
++		err = rt_rmw(rt, RT_RESET, RT_RESET_REGS, RT_RESET_REGS);
++		if (!err && mode != CAGE_MODE_10GBASER) {
++			err = rt_rmw(rt, 0x09, 0x20, 0x20) ?:
++			      rt_rmw(rt, 0x1e, 0x00, 0xe0) ?:
++			      rt_rmw(rt, 0x3f, 0x80, 0x80) ?:
++			      rt_rmw(rt, 0x31, 0x00, 0x60) ?:
++			      i2c_smbus_write_byte_data(rt, 0x3a, 0) ?:
++			      i2c_smbus_write_byte_data(rt, 0x40, 0) ?:
++			      i2c_smbus_write_byte_data(rt, 0x03, 0) ?:
++			      rt_rmw(rt, 0x2d, 0x08, 0x08);
++		}
++		if (!err)
++			err = rt_rmw(rt, RT_CDR_RESET, RT_CDR_RESET_MASK,
++				     RT_CDR_RESET_MASK) ?:
++			      rt_rmw(rt, RT_CDR_RESET, 0, RT_CDR_RESET_MASK);
++	}
++	i2c_smbus_write_byte_data(rt, RT_CHSEL, 0);
++
++	if (err)
++		dev_err(c->dev, "retimer channels %u/%u: %d\n",
++			c->rt_ch[0], c->rt_ch[1], err);
++
++	return err;
++}
++
++/* ------------------------------------------------------------------------ */
++/* Mode selection                                                             */
++
++static bool cage_mode_supported(struct mac_cage *c, enum cage_mode mode)
++{
++	switch (mode) {
++	case CAGE_MODE_10GBASER:
++		return test_bit(PHY_INTERFACE_MODE_10GBASER, c->module_ifs);
++	case CAGE_MODE_2500BASEX:
++		return test_bit(PHY_INTERFACE_MODE_2500BASEX, c->module_ifs);
++	case CAGE_MODE_1000BASEX:
++		return test_bit(PHY_INTERFACE_MODE_1000BASEX, c->module_ifs);
++	case CAGE_MODE_SGMII:
++		return test_bit(PHY_INTERFACE_MODE_SGMII, c->module_ifs);
++	default:
++		return false;
++	}
++}
++
++static void cage_build_tries(struct mac_cage *c)
++{
++	static const struct cage_try order[] = {
++		{ CAGE_MODE_10GBASER, false },
++		{ CAGE_MODE_2500BASEX, false },
++		{ CAGE_MODE_1000BASEX, true },
++		{ CAGE_MODE_1000BASEX, false },
++		{ CAGE_MODE_SGMII, true },
++	};
++	int i;
++
++	c->ntries = 0;
++	for (i = 0; i < ARRAY_SIZE(order); i++) {
++		enum cage_mode m = order[i].mode;
++
++		if (c->forced != CAGE_MODE_NONE) {
++			/* A forced 1G takes either 1G encoding */
++			if (cage_mode_speed(m) != cage_mode_speed(c->forced))
++				continue;
++		} else if (!cage_mode_supported(c, m)) {
++			continue;
++		}
++		c->tries[c->ntries++] = order[i];
++	}
++	WRITE_ONCE(c->claims_10g, c->ntries &&
++		   c->tries[0].mode == CAGE_MODE_10GBASER);
++	c->idx = 0;
++	c->locked = false;
++}
++
++static enet_mode_t cage_enet_mode(enum cage_mode mode)
++{
++	switch (mode) {
++	case CAGE_MODE_1000BASEX:
++		return (enet_mode_t)(ENET_IF_SGMII_BASEX | e_ENET_IF_SGMII |
++				     e_ENET_SPEED_10000);
++	case CAGE_MODE_2500BASEX:
++	case CAGE_MODE_SGMII:
++		return (enet_mode_t)(e_ENET_IF_SGMII | e_ENET_SPEED_10000);
++	default:
++		return e_ENET_MODE_XGMII_10000;
++	}
++}
++
++/* Move lane, retimer, MAC and PCS to @t. Called with c->lock held. */
++/* Another open cage of this SerDes holds a module that can run 10G. PLL2
++ * then belongs to 10G: 2.5G gives way unless ethtool forced it. Called with
++ * the SerDes lock held (it guards the cage list); the fields read are only
++ * hints, re-checked on every poll.
++ */
++static bool cage_yield_2500(struct mac_cage *c)
++{
++	struct mac_cage *o;
++
++	if (c->forced == CAGE_MODE_2500BASEX)
++		return false;
++
++	list_for_each_entry(o, &c->serdes->cages, node)
++		if (o != c && READ_ONCE(o->running) && READ_ONCE(o->present) &&
++		    READ_ONCE(o->claims_10g))
++			return true;
++
++	return false;
++}
++
++static int cage_apply(struct mac_cage *c, const struct cage_try *t)
++{
++	struct cage_serdes *s = c->serdes;
++	enum cage_mode prev = c->mode;
++	int err;
++
++	mutex_lock(&s->lock);
++
++	/* Probe a retune without committing: a PLL another cage needs at 10G
++	 * makes 2.5G impossible for now, which is not worth a lane halt.
++	 */
++	if (t->mode == CAGE_MODE_2500BASEX &&
++	    (cage_yield_2500(c) || cage_pll_get(c, FRATE_3_125G, false) < 0)) {
++		mutex_unlock(&s->lock);
++		return -EBUSY;
++	}
++
++	if (c->link) {
++		WRITE_ONCE(c->link, false);
++		if (c->mac_dev->phy_dev)
++			phy_trigger_machine(c->mac_dev->phy_dev);
++	}
++	err = cage_lane_set_mode(c, t->mode);
++	if (!err) {
++		c->mode = t->mode;
++		c->an = t->an;
++		if (prev == CAGE_MODE_2500BASEX && t->mode != prev)
++			cage_pll_restore(c);
++	}
++	mutex_unlock(&s->lock);
++	if (err)
++		return err;
++
++	cage_retimer_set(c, t->mode);
++
++	err = fm_mac_set_enet_mode(c->mac_dev->get_mac_handle(c->mac_dev),
++				   cage_enet_mode(t->mode),
++				   t->mode == CAGE_MODE_2500BASEX ? false : t->an);
++	if (err)
++		return err;
++
++	WRITE_ONCE(c->link, false);
++	if (prev != t->mode)
++		dev_info(c->dev, "cage: %s%s\n", cage_mode_str(t->mode),
++			 cage_mode_gmii(t->mode) && t->mode != CAGE_MODE_2500BASEX ?
++			 (t->an ? " (in-band an)" : " (no an)") : "");
++
++	return 0;
++}
++
++/* Wake the other cages of this SerDes: a PLL may have become free */
++static void cage_kick_others(struct mac_cage *c)
++{
++	struct mac_cage *o;
++
++	mutex_lock(&c->serdes->lock);
++	list_for_each_entry(o, &c->serdes->cages, node)
++		if (o != c)
++			mod_delayed_work(system_wq, &o->work, 0);
++	mutex_unlock(&c->serdes->lock);
++}
++
++/* 1 = up, 0 = down, negative = the PCS could not be read (MDIO error) */
++static int cage_read_link(struct mac_cage *c, const char **why)
++{
++	struct mac_device *mac_dev = c->mac_dev;
++	bool pcs = false;
++
++	*why = "";
++	if (!c->present || c->mode == CAGE_MODE_NONE)
++		return 0;
++
++	if (fm_mac_get_pcs_link(mac_dev->get_mac_handle(mac_dev), &pcs, NULL)) {
++		*why = "mdio read error";
++		return -EIO;
++	}
++	if (!pcs) {
++		*why = "pcs down";
++		return 0;
++	}
++	if (c->mode == CAGE_MODE_10GBASER && !mac_dev->sfp_link) {
++		*why = "module los";
++		return 0;
++	}
++
++	return 1;
++}
++
++/* Is the hardware really in @t? The lane is read back, not remembered: a
++ * PLL the other cage retuned leaves this one's lane running nothing.
++ */
++static bool cage_runs(struct mac_cage *c, const struct cage_try *t)
++{
++	enum cage_mode hw = cage_lane_read_mode(c);
++
++	if (c->mode != t->mode || c->an != t->an)
++		return false;
++	if (t->mode == CAGE_MODE_SGMII)
++		return hw == CAGE_MODE_1000BASEX;	/* same lane setup */
++
++	return hw == t->mode;
++}
++
++static bool cage_mode_allowed(struct mac_cage *c)
++{
++	int i;
++
++	if (c->mode == CAGE_MODE_2500BASEX) {
++		bool yield;
++
++		mutex_lock(&c->serdes->lock);
++		yield = cage_yield_2500(c);
++		mutex_unlock(&c->serdes->lock);
++		if (yield)
++			return false;
++	}
++
++	for (i = 0; i < c->ntries; i++)
++		if (c->tries[i].mode == c->mode && c->tries[i].an == c->an)
++			return true;
++
++	return false;
++}
++
++static void cage_work(struct work_struct *work)
++{
++	struct mac_cage *c = container_of(to_delayed_work(work),
++					  struct mac_cage, work);
++	unsigned long next = 0;
++	bool was_2500, kick, link, allowed;
++	const char *why;
++	int r;
++	int tries = 0;
++
++	mutex_lock(&c->lock);
++	was_2500 = c->mode == CAGE_MODE_2500BASEX;
++
++	if (!c->running || !c->present || !c->ntries)
++		goto out;
++
++	/* A link in a mode no longer allowed (ethtool, or a 10G module now
++	 * claiming the PLL) does not count, and the search restarts at once.
++	 */
++	allowed = cage_mode_allowed(c);
++	if (!allowed)
++		c->locked = false;
++	r = cage_read_link(c, &why);
++	if (!allowed) {
++		link = false;
++	} else if (c->link && r <= 0 &&
++		   ++c->down_reads < CAGE_DOWN_READS) {
++		/* An up link has to read down (or unreadable) a few times in
++		 * a row before the carrier drops: one bad read would cost a
++		 * bridge port its listening/learning delay.
++		 */
++		c->last_why = why;
++		next = msecs_to_jiffies(CAGE_DOWN_READ_MS);
++		goto out;
++	} else if (r < 0 && !c->link) {
++		link = false;
++	} else {
++		link = r > 0;
++		if (link && c->down_reads)
++			dev_info_ratelimited(c->dev,
++				"cage: ignored %d bad link read(s) (%s)\n",
++				c->down_reads, c->last_why);
++	}
++	if (r > 0 || !c->link)
++		c->down_reads = 0;
++	if (!link && c->link && allowed)
++		dev_info(c->dev, "cage: link down (%s)\n", why);
++	if (link != c->link) {
++		WRITE_ONCE(c->link, link);
++		if (!link)
++			c->down_since = jiffies;
++		if (c->mac_dev->phy_dev)
++			phy_trigger_machine(c->mac_dev->phy_dev);
++	}
++
++	if (link) {
++		c->pll_busy_logged = false;
++		if (!c->locked)
++			dev_info(c->dev, "cage: link up at %s\n",
++				 cage_mode_str(c->mode));
++		c->locked = true;
++		next = msecs_to_jiffies(1000);
++		goto out;
++	}
++
++	/* A link that was up and went away keeps its mode for a while, then
++	 * the search restarts -- the module may have been reflashed or
++	 * reconfigured to another rate.
++	 */
++	if (c->locked) {
++		if (time_before(jiffies, c->down_since +
++				msecs_to_jiffies(CAGE_RETRY_DOWN_MS))) {
++			next = msecs_to_jiffies(1000);
++			goto out;
++		}
++		c->locked = false;
++	}
++
++	/* Next mode that can be applied right now. With one candidate the
++	 * same mode is simply kept.
++	 */
++	while (tries++ < c->ntries) {
++		const struct cage_try *t = &c->tries[c->idx];
++		int err;
++
++		if (c->ntries == 1 && cage_runs(c, t))
++			break;
++
++		err = cage_apply(c, t);
++		c->idx = (c->idx + 1) % c->ntries;
++		if (!err)
++			break;
++		if (err != -EBUSY)
++			dev_warn(c->dev, "cage: %s: %d\n",
++				 cage_mode_str(t->mode), err);
++		else if (!c->pll_busy_logged) {
++			dev_info(c->dev, "cage: %s needs the SerDes PLL another cage is using\n",
++				 cage_mode_str(t->mode));
++			c->pll_busy_logged = true;
++		}
++	}
++	/* A lone candidate is only polled; otherwise each gets its time */
++	next = msecs_to_jiffies(c->ntries == 1 ? 1000 : CAGE_TRY_MS);
++
++out:
++	if (next)
++		schedule_delayed_work(&c->work, next);
++	kick = was_2500 && c->mode != CAGE_MODE_2500BASEX;
++	mutex_unlock(&c->lock);
++
++	if (kick)
++		cage_kick_others(c);
++}
++
++/* ------------------------------------------------------------------------ */
++/* Hooks for mac.c / mac-api.c / dpaa_ethtool.c                              */
++
++void mac_cage_module_insert(struct mac_device *mac_dev,
++			    const struct sfp_eeprom_id *id)
++{
++	struct mac_cage *c = mac_dev->cage;
++	__ETHTOOL_DECLARE_LINK_MODE_MASK(support) = { 0, };
++
++	if (!c)
++		return;
++
++	mutex_lock(&c->lock);
++	phy_interface_zero(c->module_ifs);
++	sfp_parse_support(mac_dev->sfp_bus, id, support, c->module_ifs);
++	/* A copper SFP with a PHY behind it talks SGMII to us */
++	if (sfp_may_have_phy(mac_dev->sfp_bus, id) &&
++	    test_bit(PHY_INTERFACE_MODE_1000BASEX, c->module_ifs))
++		__set_bit(PHY_INTERFACE_MODE_SGMII, c->module_ifs);
++	WRITE_ONCE(c->present, true);
++	cage_build_tries(c);
++	if (!c->ntries)
++		dev_warn(c->dev, "cage: module offers no interface this MAC can run\n");
++	mod_delayed_work(system_wq, &c->work, 0);
++	mutex_unlock(&c->lock);
++}
++
++void mac_cage_module_remove(struct mac_device *mac_dev)
++{
++	struct mac_cage *c = mac_dev->cage;
++
++	if (!c)
++		return;
++
++	mutex_lock(&c->lock);
++	WRITE_ONCE(c->present, false);
++	WRITE_ONCE(c->link, false);
++	c->locked = false;
++	mutex_unlock(&c->lock);
++	/* Let the worker see it: a 2.5G PLL may go back to 10G */
++	mod_delayed_work(system_wq, &c->work, 0);
++}
++
++void mac_cage_start(struct mac_device *mac_dev)
++{
++	struct mac_cage *c = mac_dev->cage;
++
++	if (!c)
++		return;
++
++	mutex_lock(&c->lock);
++	WRITE_ONCE(c->running, true);
++	c->locked = false;
++	c->idx = 0;
++	mod_delayed_work(system_wq, &c->work, 0);
++	mutex_unlock(&c->lock);
++}
++EXPORT_SYMBOL(mac_cage_start);
++
++void mac_cage_stop(struct mac_device *mac_dev)
++{
++	struct mac_cage *c = mac_dev->cage;
++
++	if (!c)
++		return;
++
++	mutex_lock(&c->lock);
++	WRITE_ONCE(c->running, false);
++	WRITE_ONCE(c->link, false);
++	mutex_unlock(&c->lock);
++	cancel_delayed_work_sync(&c->work);
++}
++EXPORT_SYMBOL(mac_cage_stop);
++
++/* The module's LOS changed: re-read the link now rather than at the next
++ * poll.
++ */
++void mac_cage_kick(struct mac_device *mac_dev)
++{
++	struct mac_cage *c = mac_dev->cage;
++
++	if (c)
++		mod_delayed_work(system_wq, &c->work, 0);
++}
++
++/* fixed-link link_update: what phylib publishes for a port with a cage */
++bool mac_cage_link(struct mac_device *mac_dev)
++{
++	struct mac_cage *c = mac_dev->cage;
++	bool link;
++
++	if (!c)
++		return mac_dev->sfp_link;
++
++	/* Called under the fixed MDIO bus lock: never wait on the worker. Its
++	 * last reading is what counts; it clears it before touching the
++	 * hardware.
++	 */
++	link = READ_ONCE(c->link);
++
++	return link;
++}
++EXPORT_SYMBOL(mac_cage_link);
++
++int mac_cage_get_ksettings(struct mac_device *mac_dev,
++			   struct ethtool_link_ksettings *cmd)
++{
++	struct mac_cage *c = mac_dev->cage;
++
++	if (!c)
++		return -EOPNOTSUPP;
++
++	mutex_lock(&c->lock);
++	cmd->base.port = PORT_FIBRE;
++	cmd->base.autoneg = c->forced == CAGE_MODE_NONE ? AUTONEG_ENABLE :
++							  AUTONEG_DISABLE;
++	cmd->base.speed = c->link ? cage_mode_speed(c->mode) : SPEED_UNKNOWN;
++	cmd->base.duplex = c->link ? DUPLEX_FULL : DUPLEX_UNKNOWN;
++	ethtool_link_ksettings_zero_link_mode(cmd, supported);
++	ethtool_link_ksettings_add_link_mode(cmd, supported, Autoneg);
++	ethtool_link_ksettings_add_link_mode(cmd, supported, FIBRE);
++	ethtool_link_ksettings_add_link_mode(cmd, supported, 10000baseSR_Full);
++	ethtool_link_ksettings_add_link_mode(cmd, supported, 2500baseX_Full);
++	ethtool_link_ksettings_add_link_mode(cmd, supported, 1000baseX_Full);
++	linkmode_copy(cmd->link_modes.advertising, cmd->link_modes.supported);
++	mutex_unlock(&c->lock);
++
++	return 0;
++}
++EXPORT_SYMBOL(mac_cage_get_ksettings);
++
++int mac_cage_set_ksettings(struct mac_device *mac_dev,
++			   const struct ethtool_link_ksettings *cmd)
++{
++	struct mac_cage *c = mac_dev->cage;
++	enum cage_mode forced;
++
++	if (!c)
++		return -EOPNOTSUPP;
++
++	if (cmd->base.autoneg == AUTONEG_ENABLE) {
++		forced = CAGE_MODE_NONE;
++	} else {
++		switch (cmd->base.speed) {
++		case SPEED_10000:
++			forced = CAGE_MODE_10GBASER;
++			break;
++		case SPEED_2500:
++			forced = CAGE_MODE_2500BASEX;
++			break;
++		case SPEED_1000:
++			forced = CAGE_MODE_1000BASEX;
++			break;
++		default:
++			return -EINVAL;
++		}
++	}
++
++	mutex_lock(&c->lock);
++	c->forced = forced;
++	cage_build_tries(c);
++	mod_delayed_work(system_wq, &c->work, 0);
++	mutex_unlock(&c->lock);
++
++	return 0;
++}
++EXPORT_SYMBOL(mac_cage_set_ksettings);
++
++static struct cage_serdes *cage_serdes_get(struct device *dev,
++					   struct device_node *np)
++{
++	struct device_node *dcfg_np;
++	struct cage_serdes *s;
++	int idx;
++
++	mutex_lock(&cage_serdes_list_lock);
++	list_for_each_entry(s, &cage_serdes_list, node) {
++		if (s->np == np) {
++			s->refs++;
++			goto out;
++		}
++	}
++
++	s = kzalloc(sizeof(*s), GFP_KERNEL);
++	if (!s) {
++		s = ERR_PTR(-ENOMEM);
++		goto out;
++	}
++
++	dcfg_np = of_find_compatible_node(NULL, NULL, "fsl,ls1046a-dcfg");
++	idx = dcfg_np ? of_property_match_string(dcfg_np, "reg-names",
++						 "dcfg_dcsr") : -ENODEV;
++	s->base = of_iomap(np, 0);
++	if (dcfg_np && idx >= 0) {
++		s->dcfg = of_iomap(dcfg_np, 0);
++		s->dcsr = of_iomap(dcfg_np, idx);
++	}
++	of_node_put(dcfg_np);
++	if (!s->base || !s->dcfg || !s->dcsr) {
++		dev_err(dev, "cage: cannot map the SerDes or the DCFG CCSR/DCSR\n");
++		if (s->base)
++			iounmap(s->base);
++		if (s->dcfg)
++			iounmap(s->dcfg);
++		if (s->dcsr)
++			iounmap(s->dcsr);
++		kfree(s);
++		s = ERR_PTR(-ENODEV);
++		goto out;
++	}
++
++	s->np = of_node_get(np);
++	mutex_init(&s->lock);
++	INIT_LIST_HEAD(&s->cages);
++	s->refs = 1;
++	list_add(&s->node, &cage_serdes_list);
++out:
++	mutex_unlock(&cage_serdes_list_lock);
++
++	return s;
++}
++
++static void cage_serdes_put(struct cage_serdes *s)
++{
++	mutex_lock(&cage_serdes_list_lock);
++	if (!--s->refs) {
++		list_del(&s->node);
++		iounmap(s->base);
++		iounmap(s->dcfg);
++		iounmap(s->dcsr);
++		of_node_put(s->np);
++		kfree(s);
++	}
++	mutex_unlock(&cage_serdes_list_lock);
++}
++
++int mac_cage_probe(struct mac_device *mac_dev, struct device_node *mac_node)
++{
++	struct of_phandle_args args;
++	struct cage_serdes *s;
++	struct mac_cage *c;
++	int err;
++
++	if (!mac_dev->sfp_bus || !mac_dev->mac_10g)
++		return 0;
++
++	/* The lane is driven from here: there is no Lynx 10G PHY provider in
++	 * this kernel (see the comment at the top).
++	 */
++	err = of_parse_phandle_with_args(mac_node, "mono,serdes-lane",
++					 "#phy-cells", 0, &args);
++	if (err)
++		return 0;	/* no lane described: stay at the fixed rate */
++	if (args.args_count != 1 || !of_device_is_compatible(args.np,
++							   "fsl,ls1046a-serdes1") ||
++	    (args.args[0] != 2 && args.args[0] != 3)) {
++		dev_warn(mac_dev->dev, "cage: unsupported SerDes lane, rate stays fixed\n");
++		of_node_put(args.np);
++		return 0;
++	}
++
++	c = devm_kzalloc(mac_dev->dev, sizeof(*c), GFP_KERNEL);
++	if (!c) {
++		of_node_put(args.np);
++		return -ENOMEM;
++	}
++
++	s = cage_serdes_get(mac_dev->dev, args.np);
++	of_node_put(args.np);
++	if (IS_ERR(s))
++		return PTR_ERR(s);
++
++	c->mac_dev = mac_dev;
++	c->dev = mac_dev->dev;
++	c->serdes = s;
++	c->lane = args.args[0];
++	c->forced = CAGE_MODE_NONE;
++	mutex_init(&c->lock);
++	INIT_DELAYED_WORK(&c->work, cage_work);
++
++	err = of_parse_phandle_with_fixed_args(mac_node, "mono,retimer", 2, 0,
++					       &args);
++	if (!err) {
++		c->retimer_np = args.np;	/* reference kept */
++		c->rt_ch[0] = args.args[0];
++		c->rt_ch[1] = args.args[1];
++	}
++
++	mutex_lock(&s->lock);
++	c->pccrb_xfi = (srds_read(s, PCCRB) >> cage_xfi_shift(c->lane)) &
++		       GENMASK(2, 0);
++	if (!c->pccrb_xfi)
++		c->pccrb_xfi = 1;
++	c->mode = cage_lane_read_mode(c);
++	list_add(&c->node, &s->cages);
++	mutex_unlock(&s->lock);
++
++	mac_dev->cage = c;
++	dev_info(mac_dev->dev, "cage: SerDes1 lane %c%s, runtime rate switching\n",
++		 'A' + c->lane, c->retimer_np ? " behind a retimer" : "");
++
++	return 0;
++}
++
++void mac_cage_remove(struct mac_device *mac_dev)
++{
++	struct mac_cage *c = mac_dev->cage;
++
++	if (!c)
++		return;
++
++	cancel_delayed_work_sync(&c->work);
++	mutex_lock(&c->serdes->lock);
++	list_del(&c->node);
++	mutex_unlock(&c->serdes->lock);
++	if (c->retimer)
++		put_device(&c->retimer->dev);
++	of_node_put(c->retimer_np);
++	cage_serdes_put(c->serdes);
++	mac_dev->cage = NULL;
++}
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/mac-cage.h
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/mac-cage.h
+@@ -0,0 +1,26 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/* Runtime line-rate switching for the SFP cages of 10G-capable mEMACs */
++#ifndef __MAC_CAGE_H
++#define __MAC_CAGE_H
++
++#include <linux/ethtool.h>
++#include <linux/of.h>
++
++struct mac_device;
++struct sfp_eeprom_id;
++
++int mac_cage_probe(struct mac_device *mac_dev, struct device_node *mac_node);
++void mac_cage_remove(struct mac_device *mac_dev);
++void mac_cage_module_insert(struct mac_device *mac_dev,
++			    const struct sfp_eeprom_id *id);
++void mac_cage_module_remove(struct mac_device *mac_dev);
++void mac_cage_start(struct mac_device *mac_dev);
++void mac_cage_stop(struct mac_device *mac_dev);
++void mac_cage_kick(struct mac_device *mac_dev);
++bool mac_cage_link(struct mac_device *mac_dev);
++int mac_cage_get_ksettings(struct mac_device *mac_dev,
++			   struct ethtool_link_ksettings *cmd);
++int mac_cage_set_ksettings(struct mac_device *mac_dev,
++			   const struct ethtool_link_ksettings *cmd);
++
++#endif /* __MAC_CAGE_H */
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/mac.h
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/mac.h
+@@ -76,6 +76,10 @@
+ 	 */
+ 	struct sfp_bus		*sfp_bus;
+ 	bool			 sfp_link;
++	/* Runtime line-rate switching of that cage (mac-cage.c); NULL when
++	 * the DT describes no SerDes lane for it and the rate stays fixed.
++	 */
++	struct mac_cage		*cage;
+ 
+ 	bool autoneg_pause;
+ 	bool rx_pause_req;
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/Makefile
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/Makefile
+@@ -29,7 +29,7 @@
+ fsl_dpa-objs += dpaa_eth_ceetm.o
+ endif
+ 
+-fsl_mac-objs += mac.o mac-api.o
++fsl_mac-objs += mac.o mac-api.o mac-cage.o
+ 
+ # Advanced drivers
+ ifeq ($(CONFIG_FSL_DPAA_ADVANCED_DRIVERS),y)
+--- a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_mac_ext.h
++++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_mac_ext.h
+@@ -786,6 +786,36 @@
+ t_Error FM_MAC_AdjustLink(t_Handle h_FmMac, e_EnetSpeed speed, bool fullDuplex);
+ 
+ /**************************************************************************//**
++ @Function      FM_MAC_SetEnetMode
++
++ @Description   Changes the interface of an initialized MAC at runtime, after
++                its SerDes lane was moved to another protocol: IF_MODE, the
++                TX FIFO thresholds and the internal PCS follow enetMode.
++                Supported by mEMAC (SGMII/1000BASE-X/2500BASE-X <-> XGMII/XFI).
++
++ @Param[in]     h_FmMac     - A handle to a FM Module.
++ @Param[in]     enetMode    - The new mode; a 10G MAC keeps speed 10000.
++ @Param[in]     autoneg     - In-band negotiation on the PCS (SGMII modes).
++
++ @Return        E_OK on success; Error code otherwise.
++*//***************************************************************************/
++t_Error FM_MAC_SetEnetMode(t_Handle h_FmMac, e_EnetMode enetMode, bool autoneg);
++
++/**************************************************************************//**
++ @Function      FM_MAC_GetPcsLink
++
++ @Description   Reads the receive link of the MAC's internal PCS (1G PCS in
++                an SGMII mode, 10GBASE-R PCS otherwise).
++
++ @Param[in]     h_FmMac     - A handle to a FM Module.
++ @Param[out]    p_Link      - TRUE when the PCS has link.
++ @Param[out]    p_Lpa       - Optional; 1G PCS link partner ability.
++
++ @Return        E_OK on success; Error code otherwise.
++*//***************************************************************************/
++t_Error FM_MAC_GetPcsLink(t_Handle h_FmMac, bool *p_Link, uint16_t *p_Lpa);
++
++/**************************************************************************//**
+  @Function      FM_MAC_RestartAutoneg
+ 
+  @Description   Restarts the auto-negotiation process.
+--- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.c
++++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.c
+@@ -607,6 +607,34 @@
+ 
+ /* ......................................................................... */
+ 
++t_Error FM_MAC_SetEnetMode(t_Handle h_FmMac, e_EnetMode enetMode, bool autoneg)
++{
++    t_FmMacControllerDriver *p_FmMacControllerDriver = (t_FmMacControllerDriver *)h_FmMac;
++
++    SANITY_CHECK_RETURN_ERROR(p_FmMacControllerDriver, E_INVALID_HANDLE);
++
++    if (p_FmMacControllerDriver->f_FM_MAC_SetEnetMode)
++        return p_FmMacControllerDriver->f_FM_MAC_SetEnetMode(h_FmMac, enetMode, autoneg);
++
++    RETURN_ERROR(MINOR, E_NOT_SUPPORTED, NO_MSG);
++}
++
++/* ......................................................................... */
++
++t_Error FM_MAC_GetPcsLink(t_Handle h_FmMac, bool *p_Link, uint16_t *p_Lpa)
++{
++    t_FmMacControllerDriver *p_FmMacControllerDriver = (t_FmMacControllerDriver *)h_FmMac;
++
++    SANITY_CHECK_RETURN_ERROR(p_FmMacControllerDriver, E_INVALID_HANDLE);
++
++    if (p_FmMacControllerDriver->f_FM_MAC_GetPcsLink)
++        return p_FmMacControllerDriver->f_FM_MAC_GetPcsLink(h_FmMac, p_Link, p_Lpa);
++
++    RETURN_ERROR(MINOR, E_NOT_SUPPORTED, NO_MSG);
++}
++
++/* ......................................................................... */
++
+ t_Error FM_MAC_RestartAutoneg(t_Handle h_FmMac)
+ {
+     t_FmMacControllerDriver *p_FmMacControllerDriver = (t_FmMacControllerDriver *)h_FmMac;
+--- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.h
++++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.h
+@@ -114,6 +114,8 @@
+     t_Error (*f_FM_MAC_SetPromiscuous) (t_Handle h_FmMac, bool newVal);
+     t_Error (*f_FM_MAC_SetAllMulti) (t_Handle h_FmMac, bool newVal);
+     t_Error (*f_FM_MAC_AdjustLink)     (t_Handle h_FmMac, e_EnetSpeed speed, bool fullDuplex);
++    t_Error (*f_FM_MAC_SetEnetMode)    (t_Handle h_FmMac, e_EnetMode enetMode, bool autoneg);
++    t_Error (*f_FM_MAC_GetPcsLink)     (t_Handle h_FmMac, bool *p_Link, uint16_t *p_Lpa);
+     t_Error (*f_FM_MAC_RestartAutoneg) (t_Handle h_FmMac);
+     t_Error (*f_FM_MAC_SetMaxFrameLength) (t_Handle h_FmMac, uint16_t newVal);
+ 
+--- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/memac.c
++++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/memac.c
+@@ -946,6 +946,117 @@
+     return E_OK;
+ }
+ 
++/* ......................................................................... */
++
++/* Change the interface of an initialised mEMAC at runtime, after its SerDes
++ * lane has been moved to another protocol (10GBASE-R <-> SGMII, 1000BASE-X
++ * or 2500BASE-X on MAC9/MAC10). It redoes what MemacInit() derives from the
++ * interface -- IF_MODE, the TX FIFO thresholds and the internal PCS -- and
++ * leaves the rest (addresses, pause, frame length, interrupts) as it is.
++ *
++ * The speed in enetMode is the caller's: a 10G MAC keeps 10000 there at any
++ * line rate, as at init. autoneg selects in-band (clause 37 / SGMII)
++ * negotiation on the PCS; 2500BASE-X never negotiates.
++ */
++static t_Error MemacSetEnetMode(t_Handle h_Memac, e_EnetMode enetMode, bool autoneg)
++{
++    t_Memac             *p_Memac = (t_Memac *)h_Memac;
++    struct memac_regs   *p_Regs;
++    e_EnetInterface     enetInterface;
++    uint32_t            tmp;
++    bool                fixed, slow10g;
++
++    SANITY_CHECK_RETURN_ERROR(p_Memac, E_INVALID_HANDLE);
++    SANITY_CHECK_RETURN_ERROR(!p_Memac->p_MemacDriverParam, E_INVALID_STATE);
++
++    enetInterface = ENET_INTERFACE_FROM_MODE(enetMode);
++    if (enetInterface != e_ENET_IF_SGMII &&
++        enetInterface != e_ENET_IF_XGMII &&
++        enetInterface != e_ENET_IF_XFI)
++        RETURN_ERROR(MINOR, E_NOT_SUPPORTED, ("interface 0x%x", enetInterface));
++
++    p_Regs = p_Memac->p_MemMap;
++    slow10g = (p_Memac->fmMacControllerDriver.fmRevInfo.majorRev == 6 &&
++               p_Memac->fmMacControllerDriver.fmRevInfo.minorRev == 4);
++
++    p_Memac->enetMode = enetMode;
++
++    tmp = GET_UINT32(p_Regs->if_mode);
++    tmp &= ~(IF_MODE_MASK | IF_MODE_HD | IF_MODE_RGMII | IF_MODE_RGMII_AUTO);
++    if (enetInterface == e_ENET_IF_SGMII)
++    {
++        tmp |= IF_MODE_GMII;
++        WRITE_UINT32(p_Regs->if_mode, tmp);
++        WRITE_UINT32(p_Regs->tx_fifo_sections,
++                     TX_FIFO_SECTIONS_TX_AVAIL_1G |
++                     TX_FIFO_SECTIONS_TX_EMPTY_DEFAULT_1G);
++
++        /* The PCS setup reads "fixed" to decide whether to negotiate */
++        fixed = p_Memac->fixed;
++        p_Memac->fixed = !autoneg;
++        MemacInitInternalPhy(h_Memac);
++        p_Memac->fixed = fixed;
++    }
++    else
++    {
++        tmp |= IF_MODE_XGMII;
++        WRITE_UINT32(p_Regs->if_mode, tmp);
++        WRITE_UINT32(p_Regs->tx_fifo_sections,
++                     (slow10g ? TX_FIFO_SECTIONS_TX_AVAIL_SLOW_10G :
++                                TX_FIFO_SECTIONS_TX_AVAIL_10G) |
++                     TX_FIFO_SECTIONS_TX_EMPTY_DEFAULT_10G);
++    }
++
++    return E_OK;
++}
++
++/* ......................................................................... */
++
++/* Receive link of the PCS behind the MAC's own MDIO: the 1G PCS (clause 22,
++ * BMSR) in an SGMII mode, the 10GBASE-R PCS (clause 45, MMD 3 PCS status 1)
++ * otherwise. Both bits latch low, so read twice for the current state.
++ * p_Lpa, if set, gets the 1G PCS's link partner ability (0 at 10G).
++ */
++static t_Error MemacGetPcsLink(t_Handle h_Memac, bool *p_Link, uint16_t *p_Lpa)
++{
++    t_Memac     *p_Memac = (t_Memac *)h_Memac;
++    e_EnetMode  enetMode;
++    uint16_t    val = 0, lpa = 0;
++    t_Error     err;
++
++    SANITY_CHECK_RETURN_ERROR(p_Memac, E_INVALID_HANDLE);
++    SANITY_CHECK_RETURN_ERROR(!p_Memac->p_MemacDriverParam, E_INVALID_STATE);
++    SANITY_CHECK_RETURN_ERROR(p_Link, E_NULL_POINTER);
++
++    enetMode = p_Memac->enetMode;
++    if (ENET_INTERFACE_FROM_MODE(enetMode) == e_ENET_IF_SGMII)
++    {
++        /* MII access picks clause 22 or 45 by the speed in enetMode; the
++         * 1G PCS of a 10G MAC is clause 22 (see SetupSgmiiInternalPhy) */
++        p_Memac->enetMode = MAKE_ENET_MODE(ENET_INTERFACE_FROM_MODE(enetMode),
++                                           e_ENET_SPEED_1000);
++        MEMAC_MII_ReadPhyReg(p_Memac, PHY_MDIO_ADDR, 0x1, &val);
++        err = MEMAC_MII_ReadPhyReg(p_Memac, PHY_MDIO_ADDR, 0x1, &val);
++        if (!err)
++            err = MEMAC_MII_ReadPhyReg(p_Memac, PHY_MDIO_ADDR, 0x5, &lpa);
++        p_Memac->enetMode = enetMode;
++    }
++    else
++    {
++        /* Clause 45: port 0, MMD 3 (PCS), register 1 */
++        MEMAC_MII_ReadPhyReg(p_Memac, 3, 0x1, &val);
++        err = MEMAC_MII_ReadPhyReg(p_Memac, 3, 0x1, &val);
++    }
++    if (err)
++        RETURN_ERROR(MINOR, err, NO_MSG);
++
++    *p_Link = !!(val & 0x0004);
++    if (p_Lpa)
++        *p_Lpa = lpa;
++
++    return E_OK;
++}
++
+ /*****************************************************************************/
+ /*                      mEMAC Init & Free API                                   */
+ /*****************************************************************************/
+@@ -1171,6 +1282,8 @@
+     p_FmMacControllerDriver->f_FM_MAC_SetPromiscuous            = MemacSetPromiscuous;
+     p_FmMacControllerDriver->f_FM_MAC_SetAllMulti               = MemacSetAllMulti;
+     p_FmMacControllerDriver->f_FM_MAC_AdjustLink                = MemacAdjustLink;
++    p_FmMacControllerDriver->f_FM_MAC_SetEnetMode               = MemacSetEnetMode;
++    p_FmMacControllerDriver->f_FM_MAC_GetPcsLink                = MemacGetPcsLink;
+     p_FmMacControllerDriver->f_FM_MAC_RestartAutoneg            = NULL;
+ 
+     p_FmMacControllerDriver->f_FM_MAC_Enable                    = MemacEnable;
+--- a/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_fsl_fman.h
++++ b/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_fsl_fman.h
+@@ -613,6 +613,12 @@
+ int fm_mac_adjust_link(struct fm_mac_dev *fm_mac_dev,
+ 		bool link, int speed, bool duplex);
+ 
++int fm_mac_set_enet_mode(struct fm_mac_dev *fm_mac_dev, e_EnetMode mode,
++		bool autoneg);
++
++int fm_mac_get_pcs_link(struct fm_mac_dev *fm_mac_dev, bool *link,
++		uint16_t *lpa);
++
+ int fm_mac_enable_1588_time_stamp(struct fm_mac_dev *fm_mac_dev);
+ 
+ int fm_mac_disable_1588_time_stamp(struct fm_mac_dev *fm_mac_dev);
+--- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
++++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
+@@ -1771,6 +1771,32 @@
+ }
+ EXPORT_SYMBOL(fm_mac_adjust_link);
+ 
++int fm_mac_set_enet_mode(struct fm_mac_dev *fm_mac_dev, e_EnetMode mode,
++		bool autoneg)
++{
++	int	 _errno;
++	t_Error	 err;
++
++	err = FM_MAC_SetEnetMode(fm_mac_dev, mode, autoneg);
++	_errno = -GET_ERROR_TYPE(err);
++	if (unlikely(_errno < 0))
++		pr_err("FM_MAC_SetEnetMode() = 0x%08x\n", err);
++
++	return _errno;
++}
++EXPORT_SYMBOL(fm_mac_set_enet_mode);
++
++int fm_mac_get_pcs_link(struct fm_mac_dev *fm_mac_dev, bool *link,
++		uint16_t *lpa)
++{
++	t_Error	 err;
++
++	err = FM_MAC_GetPcsLink(fm_mac_dev, link, lpa);
++
++	return -GET_ERROR_TYPE(err);
++}
++EXPORT_SYMBOL(fm_mac_get_pcs_link);
++
+ int fm_mac_enable_1588_time_stamp(struct fm_mac_dev *fm_mac_dev)
+ {
+ 	int			 _errno;
+--- a/drivers/net/phy/sfp.c
++++ b/drivers/net/phy/sfp.c
+@@ -205,7 +205,12 @@
+ #define T_PROBE_RETRY_INIT	msecs_to_jiffies(100)
+ #define R_PROBE_RETRY_INIT	10
+ #define T_PROBE_RETRY_SLOW	msecs_to_jiffies(5000)
+-#define R_PROBE_RETRY_SLOW	12
++/* GPON sticks emulate their EEPROM in firmware and leave the bus unanswered
++ * until they have booted: a Huawei MA5671A took longer than the minute that
++ * 12 tries gave it, and the cage then stayed in error until re-plugged.
++ * Three minutes; a module that answers is not affected.
++ */
++#define R_PROBE_RETRY_SLOW	36
+ 
+ /* SFP modules appear to always have their PHY configured for bus address
+  * 0x56 (which with mdio-i2c, translates to a PHY address of 22).
